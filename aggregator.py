@@ -1,76 +1,105 @@
+import asyncio
 import os
 import logging
-import asyncio
 from dotenv import load_dotenv
-from pyrogram import Client, filters, idle
+from pyrogram import Client, filters
 from pyrogram.types import Message
+import aiosqlite
 
-# Налаштування логування
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S"
-)
+# Виправлення для сумісності asyncio з новими версіями Python
+try:
+    asyncio.get_event_loop()
+except RuntimeError:
+    asyncio.set_event_loop(asyncio.new_event_loop())
 
-# Завантаження змінних із .env
 load_dotenv()
 
-API_ID = int(os.getenv("API_ID", "0"))
+API_ID = int(os.getenv("API_ID", 0))
 API_HASH = os.getenv("API_HASH", "")
-TARGET_CHANNEL = os.getenv("TARGET_CHANNEL", "metaaggregator").strip()
-DONOR_CHANNELS = [x.strip() for x in os.getenv("DONOR_CHANNELS", "cryptosadua,tropimoney,teamcryptoua,soyercrypto,newgramua,fwfewffw").split(",") if x.strip()]
+TARGET_CHANNEL = os.getenv("TARGET_CHANNEL", "metaaggregator")
+DONOR_CHANNELS_RAW = os.getenv("DONOR_CHANNELS", "")
 
-app = Client(
-    "meta_aggregator_session",
-    api_id=API_ID,
-    api_hash=API_HASH
-)
+DONOR_CHANNELS = [ch.strip() for ch in DONOR_CHANNELS_RAW.split(",") if ch.strip()]
 
-@app.on_message(filters.channel)
-async def handle_new_post(client: Client, message: Message):
-    # Перевіряємо, чи належить пост до відстежуваних донорів
-    if not hasattr(client, "donor_ids") or message.chat.id not in client.donor_ids:
-        return
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
+app = Client("meta_aggregator_session", api_id=API_ID, api_hash=API_HASH)
+
+DB_FILE = "aggregator_db.sqlite"
+
+async def init_db():
+    async with aiosqlite.connect(DB_FILE) as db:
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS resolved_chats (
+                username TEXT PRIMARY KEY,
+                chat_id INTEGER
+            )
+        """)
+        await db.commit()
+
+async def get_cached_chat_id(client, username):
+    clean_username = username.lstrip("@")
+    async with aiosqlite.connect(DB_FILE) as db:
+        async with db.execute("SELECT chat_id FROM resolved_chats WHERE username = ?", (clean_username,)) as cursor:
+            row = await cursor.fetchone()
+            if row:
+                return row[0]
+    
     try:
-        # Нативна пересилка (репост із збереженням плашки джерела)
-        await client.forward_messages(
-            chat_id=client.target_chat_id,
-            from_chat_id=message.chat.id,
-            message_ids=message.id
-        )
-        logging.info(f"🔄 Пост успішно репостнуто з [{message.chat.title}] -> [{TARGET_CHANNEL}]")
+        chat = await client.get_chat(clean_username)
+        chat_id = chat.id
+        async with aiosqlite.connect(DB_FILE) as db:
+            await db.execute("INSERT OR REPLACE INTO resolved_chats (username, chat_id) VALUES (?, ?)", (clean_username, chat_id))
+            await db.commit()
+        logging.info(f"Отримано та збережено ID для @{clean_username}: {chat_id}")
+        return chat_id
     except Exception as e:
-        logging.error(f"❌ Помилка при пересиланні з {message.chat.title} ({message.chat.id}): {e}")
+        logging.error(f"Помилка при отриманні ID для @{clean_username}: {e}")
+        return None
+
+donor_chat_ids = []
+
+@app.on_message(filters.chat(donor_chat_ids) & (filters.text | filters.photo | filters.video | filters.document))
+async def forward_handler(client: Client, message: Message):
+    try:
+        target_id = await get_cached_chat_id(client, TARGET_CHANNEL)
+        if not target_id:
+            logging.error(f"Не вдалося знайти ID цільового каналу: {TARGET_CHANNEL}")
+            return
+        
+        await message.forward(target_id)
+        logging.info(f"Успішно переслано пост з каналу {message.chat.title or message.chat.id}")
+    except Exception as e:
+        logging.error(f"Помилка пересилання повідомлення: {e}")
 
 async def main():
-    await app.start()
-    logging.info("🚀 Aggregator v7.0 Pro успішно ініціалізовано!")
+    global donor_chat_ids
+    await init_db()
+    async with app:
+        logging.info("🚀 Запуск агрегатора...")
+        
+        target_id = await get_cached_chat_id(app, TARGET_CHANNEL)
+        if target_id:
+            logging.info(f"🎯 Цільовий канал підключено: {TARGET_CHANNEL} (ID: {target_id})")
+        else:
+            logging.warning(f"⚠️ Увага: Не вдалося знайти цільовий канал {TARGET_CHANNEL}")
 
-    # Резолвимо та кешуємо канали-донори (усуває Peer id invalid)
-    resolved_donors = []
-    for username in DONOR_CHANNELS:
-        try:
-            chat = await app.get_chat(username)
-            resolved_donors.append(chat.id)
-            logging.info(f"✅ Донор підключений: {chat.title} (ID: {chat.id})")
-        except Exception as e:
-            logging.error(f"❌ Не вдалося підключити донора {username}: {e}")
+        for donor in DONOR_CHANNELS:
+            cid = await get_cached_chat_id(app, donor)
+            if cid:
+                donor_chat_ids.append(cid)
+                logging.info(f"✅ Донор підключено: @{donor} (ID: {cid})")
+            else:
+                logging.warning(f"⚠️ Не вдалося підключити донора: @{donor}")
 
-    app.donor_ids = resolved_donors
+        if not donor_chat_ids:
+            logging.error("❌ Жодного донора не підключено! Перевірте налаштування DONOR_CHANNELS.")
+            return
 
-    # Кешуємо цільовий канал
-    try:
-        target_chat = await app.get_chat(TARGET_CHANNEL)
-        app.target_chat_id = target_chat.id
-        logging.info(f"🎯 Цільовий канал підключений: {target_chat.title} (ID: {target_chat.id})")
-    except Exception as e:
-        logging.error(f"❌ Не вдалося підключити цільовий канал {TARGET_CHANNEL}: {e}")
-
-    logging.info("🛰️ Бот активний та відстежує нові пости...")
-    await idle()
-    await app.stop()
+        logging.info(f"🛰️ Бот успішно запущений і слухає {len(donor_chat_ids)} донорів 24/7...")
+        
+        # Тримаємо клієнта активним
+        await asyncio.Future()
 
 if __name__ == "__main__":
-    loop = asyncio.get_event_loop()
-    loop.run_until_complete(main())
+    app.run(main())
