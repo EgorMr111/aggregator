@@ -11,7 +11,7 @@ logging.basicConfig(
     format="%(asctime)s - %(levelname)s - %(message)s"
 )
 
-# Читання змінних середовища або підстановка (бажано через .env / Render Environment Variables)
+# Читання змінних середовища
 API_ID = int(os.getenv("API_ID", "0"))
 API_HASH = os.getenv("API_HASH", "")
 SESSION_NAME = os.getenv("SESSION_NAME", "aggregator_session")
@@ -19,7 +19,7 @@ SESSION_NAME = os.getenv("SESSION_NAME", "aggregator_session")
 # Ініціалізація Pyrogram клієнта
 app = Client(SESSION_NAME, api_id=API_ID, api_hash=API_HASH)
 
-# --- МІНІ-ВЕБСЕРВЕР ДЛЯ RENDER (Щоб бот не засинав) ---
+# --- МІНІ-ВЕБСЕРВЕР ДЛЯ RENDER (Щоб бот не засинав і тримав порт) ---
 async def handle_ping(request):
     return web.Response(text="Bot is running 24/7!")
 
@@ -37,16 +37,16 @@ async def start_web_server():
 # --- ЛОГІКА АГРЕГАТОРА ---
 @app.on_message(filters.channel)
 async def handle_channel_posts(client, message):
-    # Тут ваша логіка пересилання/обробки повідомлень від донорів
+    # Тут ваша логіка обробки та пересилання повідомлень
     pass
 
-async main():
+async def main():
     # 1. Запускаємо вебсервер для Render
     await start_web_server()
     
     # 2. Запускаємо Pyrogram клієнт
     await app.start()
-    logging.info("🛰️ Бот успішно запущений і працює 24/7...")
+    logging.info("🛰️ Бот успішно запущений і працює 24/7 у хмарі...")
     
     # Утримуємо роботу програми
     await asyncio.Event().wait()
